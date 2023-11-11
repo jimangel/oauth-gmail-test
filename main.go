@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"fmt"
 	"log"
@@ -19,30 +20,46 @@ import (
 	"google.golang.org/api/option"
 )
 
+// set the global oauth2 vars
 var (
 	config        *oauth2.Config
 	inMemoryToken *oauth2.Token
 	sf            singleflight.Group
 )
 
+// getCredentialsFilePath retrieves the file path for OAuth 2.0 credentials (client ID / secret).
 func getCredentialsFilePath() string {
-	// Use an environment variable to get the path
 	path := os.Getenv("CREDENTIALS_JSON_PATH")
 	if path == "" {
-		log.Fatal("The environment variable CREDENTIALS_JSON_PATH is not set.")
+		log.Fatal("Environment variable CREDENTIALS_JSON_PATH is not set.")
 	}
 	return path
 }
 
+// init the OAUTH credentials
+func init() {
+	var err error
+	credentialsPath := getCredentialsFilePath()
+	b, err := os.ReadFile(credentialsPath)
+	if err != nil {
+		log.Fatalf("Unable to read client secret file: %v", err)
+	}
+
+	config, err = google.ConfigFromJSON(b, gmail.GmailSendScope)
+	if err != nil {
+		log.Fatalf("Unable to parse client secret file to config: %v", err)
+	}
+}
+
+// startLocalServer starts a local HTTP server to listen for OAuth callback.
 func startLocalServer(config *oauth2.Config) (chan string, string) {
-	listener, err := net.Listen("tcp", "localhost:0") // "0" to auto-select an available port
+	listener, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
 		log.Fatalf("Failed to listen on a port: %v", err)
 	}
 	port := listener.Addr().(*net.TCPAddr).Port
 	authCodeChannel := make(chan string)
 
-	// Create the redirect URL based on the selected port and update the config
 	redirectURL := fmt.Sprintf("http://localhost:%v/", port)
 	config.RedirectURL = redirectURL
 
@@ -54,22 +71,43 @@ func startLocalServer(config *oauth2.Config) (chan string, string) {
 	return authCodeChannel, redirectURL
 }
 
-// getClient uses an in-memory token instead of a file.
-func getClient(config *oauth2.Config) *http.Client {
-	tok, err, _ := sf.Do("token", func() (interface{}, error) {
-		if inMemoryToken == nil || !tokenHasScopes(inMemoryToken, config.Scopes) {
-			authCodeChannel, _ := startLocalServer(config)
-			newToken := getTokenFromWeb(config, authCodeChannel)
-			inMemoryToken = newToken
-		}
-		return inMemoryToken, nil
-	})
-
+// openBrowser attempts to open the authentication URL in a web browser.
+func openBrowser(url string) {
+	var err error
+	switch runtime.GOOS {
+	case "linux":
+		err = exec.Command("xdg-open", url).Start()
+	case "windows":
+		err = exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
+	case "darwin":
+		err = exec.Command("open", url).Start()
+	default:
+		err = fmt.Errorf("unsupported platform")
+	}
 	if err != nil {
-		log.Fatalf("Unable to retrieve token: %v", err)
+		log.Fatalf("Unable to open browser: %v", err)
+	}
+}
+
+// getTokenFromWeb handles OAuth authentication flow and retrieves the token.
+func getTokenFromWeb(config *oauth2.Config, authCodeChannel chan string) *oauth2.Token {
+	// generateStateToken generates a random state token for OAuth authentication.
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		log.Fatalf("Unable to generate state token: %v", err)
 	}
 
-	return config.Client(context.Background(), tok.(*oauth2.Token))
+	stateToken := base64.URLEncoding.EncodeToString(b)
+	authURL := config.AuthCodeURL(stateToken, oauth2.AccessTypeOffline)
+
+	openBrowser(authURL)
+
+	authCode := <-authCodeChannel
+	tok, err := config.Exchange(context.Background(), authCode)
+	if err != nil {
+		log.Fatalf("Unable to retrieve token from web: %v", err)
+	}
+	return tok
 }
 
 // tokenHasScopes checks if the token includes all the required scopes.
@@ -77,12 +115,7 @@ func tokenHasScopes(tok *oauth2.Token, scopes []string) bool {
 	if tok == nil {
 		return false
 	}
-	var grantedScopes []string
-	if scopeStr, ok := tok.Extra("scope").(string); ok {
-		grantedScopes = strings.Split(scopeStr, " ")
-	} else {
-		return false
-	}
+	grantedScopes := strings.Split(tok.Extra("scope").(string), " ")
 
 	grantedScopesMap := make(map[string]bool)
 	for _, scope := range grantedScopes {
@@ -97,85 +130,71 @@ func tokenHasScopes(tok *oauth2.Token, scopes []string) bool {
 	return true
 }
 
-func getTokenFromWeb(config *oauth2.Config, authCodeChannel chan string) *oauth2.Token {
-	authURL := config.AuthCodeURL("state-token", oauth2.AccessTypeOffline)
-	openBrowser(authURL)
-	fmt.Printf("Authorize this app at this URL: %s", authURL)
+// getClient retrieves an HTTP client using the provided OAuth2 configuration.
+func getClient(config *oauth2.Config) (*http.Client, error) {
+	tok, err, _ := sf.Do("token", func() (interface{}, error) {
+		if inMemoryToken == nil || !tokenHasScopes(inMemoryToken, config.Scopes) {
+			authCodeChannel, _ := startLocalServer(config)
+			newToken := getTokenFromWeb(config, authCodeChannel)
+			inMemoryToken = newToken
+		}
+		return inMemoryToken, nil
+	})
 
-	// Listen for the authorization code on the authCodeChannel
-	authCode := <-authCodeChannel
-
-	tok, err := config.Exchange(context.Background(), authCode)
 	if err != nil {
-		log.Fatalf("Unable to retrieve token from web: %v", err)
+		return nil, fmt.Errorf("unable to retrieve token: %v", err)
 	}
-	return tok
+
+	return config.Client(context.Background(), tok.(*oauth2.Token)), nil
 }
 
-func openBrowser(url string) {
-	var err error
-	switch runtime.GOOS {
-	case "linux":
-		err = exec.Command("xdg-open", url).Start()
-	case "windows":
-		err = exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
-	case "darwin":
-		err = exec.Command("open", url).Start()
-	default:
-		err = fmt.Errorf("unsupported platform")
+// getEmailTo retrieves the recipient email address from an environment variable.
+func getEmailTo() (string, error) {
+	emailTo := os.Getenv("EMAIL_TO")
+	if emailTo == "" {
+		return "", fmt.Errorf("environment variable EMAIL_TO is not set")
 	}
-	if err != nil {
-		log.Fatalf("Unable to open browser %v", err)
-	}
+	return emailTo, nil
 }
 
-func sendTestEmail(service *gmail.Service) {
-	var message gmail.Message
-
-	emailTo := "REPLACE_ME@EXAMPLE.COM" // Set the recipient's email address here
+// sendTestEmail sends a test email using the Gmail service.
+func sendTestEmail(service *gmail.Service, emailTo string) error {
 	subject := "Subject: Test Email\n"
 	mime := "MIME-version: 1.0;\nContent-Type: text/plain; charset=\"UTF-8\";\n\n"
 	body := "This is a test email sent by a Golang application."
 	msg := []byte("to: " + emailTo + "\r\n" +
-		"from: me\r\n" + // Use "me" as the sender
+		"from: me\r\n" +
 		subject +
 		mime +
 		"\r\n" + body)
 
+	var message gmail.Message
 	message.Raw = base64.URLEncoding.EncodeToString(msg)
 
-	// Send the email
-	_, err := service.Users.Messages.Send("me", &message).Do()
-	if err != nil {
-		log.Fatalf("Unable to send email %v", err)
+	if _, err := service.Users.Messages.Send("me", &message).Do(); err != nil {
+		return fmt.Errorf("unable to send email: %v", err)
 	}
-
-	fmt.Println("Test email sent!")
+	return nil
 }
 
 func main() {
-	credentials := getCredentialsFilePath()
-
-	b, err := os.ReadFile(credentials)
+	emailTo, err := getEmailTo()
 	if err != nil {
-		log.Fatalf("Unable to read client secret file: %v", err)
+		log.Fatal(err)
 	}
 
-	config, err = google.ConfigFromJSON(b, gmail.GmailSendScope)
+	client, err := getClient(config)
 	if err != nil {
-		log.Fatalf("Unable to parse client secret file to config: %v", err)
+		log.Fatal(err)
 	}
 
-	client := getClient(config)
-
-	srv, err := gmail.NewService(context.Background(), option.WithHTTPClient(client))
+	gmailService, err := gmail.NewService(context.Background(), option.WithHTTPClient(client))
 	if err != nil {
-		log.Fatalf("Unable to retrieve Gmail client: %v", err)
+		log.Fatal(err)
 	}
 
-	// Since we don't have the email scope, we will not be able to retrieve the user's email address.
-	// Thus, you need to set the user's email address manually or through another mechanism.
-	//userEmail := "user@example.com" // Replace with the actual email address or retrieve it from another source
-
-	sendTestEmail(srv)
+	if err := sendTestEmail(gmailService, emailTo); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("Test email sent!")
 }

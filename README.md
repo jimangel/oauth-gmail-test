@@ -28,7 +28,10 @@ Note: I believe there is a low(er) quota on sending gmail messages this way. Do 
 # export oauth clientID/secret info
 export CREDENTIALS_JSON_PATH="$HOME/credentials.json"
 
-# run the app (opens browser to log in)
+# export recipient
+export EMAIL_TO="EMAIL@ADDRESS.COM"
+
+# run the app (opens browser to log in, or add `--no-browser` to copy/paste)
 go run main.go
 
 # token stays in memory, an authorization call is made each time via browser
