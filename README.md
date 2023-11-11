@@ -10,10 +10,7 @@ Note: I believe there is a low(er) quota on sending gmail messages this way. Do 
 
 ## TODO
 
-- read env var for recipient
-- create `--no-browser` option
 - consider embedding the clientID/secret in the app "not secret" (https://stackoverflow.com/a/73779731) for OSS
-- implement state-tokens better
 
 ## Setup
 

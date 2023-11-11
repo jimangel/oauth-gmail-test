@@ -4,10 +4,12 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"flag"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"runtime"
@@ -45,6 +47,7 @@ func init() {
 		log.Fatalf("Unable to read client secret file: %v", err)
 	}
 
+	// request the SEND scope via gmail API from user
 	config, err = google.ConfigFromJSON(b, gmail.GmailSendScope)
 	if err != nil {
 		log.Fatalf("Unable to parse client secret file to config: %v", err)
@@ -53,27 +56,37 @@ func init() {
 
 // startLocalServer starts a local HTTP server to listen for OAuth callback.
 func startLocalServer(config *oauth2.Config) (chan string, string) {
-	listener, err := net.Listen("tcp", "localhost:0")
+	listener, err := net.Listen("tcp", "localhost:0") // Listens on a random port on localhost.
 	if err != nil {
-		log.Fatalf("Failed to listen on a port: %v", err)
+		log.Fatalf("Failed to listen on a port: %v", err) // Logs fatal error if listening fails.
 	}
-	port := listener.Addr().(*net.TCPAddr).Port
-	authCodeChannel := make(chan string)
+	port := listener.Addr().(*net.TCPAddr).Port // Retrieves the chosen port.
+	authCodeChannel := make(chan string)        // Channel to pass the authorization code.
 
-	redirectURL := fmt.Sprintf("http://localhost:%v/", port)
-	config.RedirectURL = redirectURL
+	redirectURL := fmt.Sprintf("http://localhost:%v/", port) // Sets the redirect URL for the OAuth2 flow.
+	config.RedirectURL = redirectURL                         // Updates the OAuth2 config with the redirect URL.
 
+	// Goroutine to handle the HTTP request and extract the authorization code.
 	go http.Serve(listener, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintln(w, "Authentication successful! You may now close this window.")
-		authCodeChannel <- r.URL.Query().Get("code")
+		fmt.Fprintln(w, "Authentication successful! You may now close this window.") // Response to the user.
+		authCodeChannel <- r.URL.Query().Get("code")                                 // Sends the authorization code to the channel.
 	}))
 
 	return authCodeChannel, redirectURL
 }
 
-// openBrowser attempts to open the authentication URL in a web browser.
-func openBrowser(url string) {
+// openBrowser tries to open the authentication URL in the user's web browser.
+func openBrowser(url string, noBrowser bool) {
+	if noBrowser {
+		// If --no-browser flag is set, outputs the URL to the console instead of opening a browser.
+		fmt.Println("Open the following URL in your browser and authorize the application:")
+		fmt.Printf("\033[1;34m%s\033[0m\n", url) // Prints the URL in blue color.
+		fmt.Println("\nIgnore the 'This site can't be reached / localhost refused to connect' error, and copy the full URL from the browser's address bar and paste it here.")
+		return
+	}
+
 	var err error
+	// Opens the URL in a web browser based on the user's operating system.
 	switch runtime.GOOS {
 	case "linux":
 		err = exec.Command("xdg-open", url).Start()
@@ -85,27 +98,52 @@ func openBrowser(url string) {
 		err = fmt.Errorf("unsupported platform")
 	}
 	if err != nil {
-		log.Fatalf("Unable to open browser: %v", err)
+		log.Fatalf("Unable to open browser: %v", err) // Logs fatal error if opening the browser fails.
 	}
 }
 
-// getTokenFromWeb handles OAuth authentication flow and retrieves the token.
-func getTokenFromWeb(config *oauth2.Config, authCodeChannel chan string) *oauth2.Token {
-	// generateStateToken generates a random state token for OAuth authentication.
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		log.Fatalf("Unable to generate state token: %v", err)
+// getTokenFromWeb handles the OAuth authentication flow and retrieves the token.
+func getTokenFromWeb(config *oauth2.Config, authCodeChannel chan string, noBrowser bool) *oauth2.Token {
+	var authURL string
+	// Generates the authentication URL with or without state token based on the --no-browser flag.
+	if noBrowser {
+		authURL = config.AuthCodeURL("", oauth2.AccessTypeOffline)
+	} else {
+		b := make([]byte, 32)
+		if _, err := rand.Read(b); err != nil {
+			log.Fatalf("Unable to generate state token: %v", err) // Logs fatal error if state token generation fails.
+		}
+		stateToken := base64.URLEncoding.EncodeToString(b)
+		authURL = config.AuthCodeURL(stateToken, oauth2.AccessTypeOffline)
 	}
 
-	stateToken := base64.URLEncoding.EncodeToString(b)
-	authURL := config.AuthCodeURL(stateToken, oauth2.AccessTypeOffline)
+	openBrowser(authURL, noBrowser) // Opens the authentication URL in the browser.
 
-	openBrowser(authURL)
+	var authCode string
+	if noBrowser {
+		// Handles manual input of the authorization code if the --no-browser flag is set.
+		fmt.Println("Enter the full redirect URL from your browser:")
+		var redirectURL string
+		_, err := fmt.Scan(&redirectURL)
+		if err != nil {
+			log.Fatalf("Failed to read input: %v", err) // Logs fatal error if input reading fails.
+		}
 
-	authCode := <-authCodeChannel
+		parsedURL, err := url.Parse(redirectURL)
+		if err != nil {
+			log.Fatalf("Failed to parse redirect URL: %v", err) // Logs fatal error if URL parsing fails.
+		}
+		authCode = parsedURL.Query().Get("code")
+		if authCode == "" {
+			log.Fatal("Authorization code not found in the URL") // Logs fatal error if authorization code is missing.
+		}
+	} else {
+		authCode = <-authCodeChannel // Receives the authorization code from the channel.
+	}
+
 	tok, err := config.Exchange(context.Background(), authCode)
 	if err != nil {
-		log.Fatalf("Unable to retrieve token from web: %v", err)
+		log.Fatalf("Unable to retrieve token from web: %v", err) // Logs fatal error if token exchange fails.
 	}
 	return tok
 }
@@ -113,39 +151,46 @@ func getTokenFromWeb(config *oauth2.Config, authCodeChannel chan string) *oauth2
 // tokenHasScopes checks if the token includes all the required scopes.
 func tokenHasScopes(tok *oauth2.Token, scopes []string) bool {
 	if tok == nil {
-		return false
+		return false // Returns false if token is nil.
 	}
-	grantedScopes := strings.Split(tok.Extra("scope").(string), " ")
+	grantedScopes := strings.Split(tok.Extra("scope").(string), " ") // Splits the token scopes into a slice.
 
-	grantedScopesMap := make(map[string]bool)
+	grantedScopesMap := make(map[string]bool) // Map to store the granted scopes.
 	for _, scope := range grantedScopes {
-		grantedScopesMap[scope] = true
+		grantedScopesMap[scope] = true // Maps each granted scope to true.
 	}
 
+	// Checks if all required scopes are included in the granted scopes.
 	for _, scope := range scopes {
 		if !grantedScopesMap[scope] {
-			return false
+			return false // Returns false if any required scope is missing.
 		}
 	}
 	return true
 }
 
 // getClient retrieves an HTTP client using the provided OAuth2 configuration.
-func getClient(config *oauth2.Config) (*http.Client, error) {
+func getClient(config *oauth2.Config, noBrowser bool) (*http.Client, error) {
 	tok, err, _ := sf.Do("token", func() (interface{}, error) {
+		// If token is nil or does not have required scopes, initiates the token retrieval process.
 		if inMemoryToken == nil || !tokenHasScopes(inMemoryToken, config.Scopes) {
-			authCodeChannel, _ := startLocalServer(config)
-			newToken := getTokenFromWeb(config, authCodeChannel)
-			inMemoryToken = newToken
+			var newToken *oauth2.Token
+			if noBrowser {
+				newToken = getTokenFromWeb(config, nil, noBrowser)
+			} else {
+				authCodeChannel, _ := startLocalServer(config)
+				newToken = getTokenFromWeb(config, authCodeChannel, noBrowser)
+			}
+			inMemoryToken = newToken // Updates the in-memory token.
 		}
 		return inMemoryToken, nil
 	})
 
 	if err != nil {
-		return nil, fmt.Errorf("unable to retrieve token: %v", err)
+		return nil, fmt.Errorf("unable to retrieve token: %v", err) // Returns error if token retrieval fails.
 	}
 
-	return config.Client(context.Background(), tok.(*oauth2.Token)), nil
+	return config.Client(context.Background(), tok.(*oauth2.Token)), nil // Returns the OAuth2 HTTP client.
 }
 
 // getEmailTo retrieves the recipient email address from an environment variable.
@@ -177,13 +222,17 @@ func sendTestEmail(service *gmail.Service, emailTo string) error {
 	return nil
 }
 
+// main function with flag parsing
 func main() {
+	noBrowserFlag := flag.Bool("no-browser", false, "Set this flag to manually enter the authorization code")
+	flag.Parse()
+
 	emailTo, err := getEmailTo()
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	client, err := getClient(config)
+	client, err := getClient(config, *noBrowserFlag)
 	if err != nil {
 		log.Fatal(err)
 	}
