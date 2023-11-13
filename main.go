@@ -15,6 +15,8 @@ import (
 	"runtime"
 	"strings"
 
+	secretmanager "cloud.google.com/go/secretmanager/apiv1"
+	"cloud.google.com/go/secretmanager/apiv1/secretmanagerpb"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	"golang.org/x/sync/singleflight"
@@ -29,36 +31,76 @@ var (
 	sf            singleflight.Group
 )
 
-// getCredentialsFilePath retrieves the file path for OAuth 2.0 credentials (client ID / secret).
-func getCredentialsFilePath() string {
-	path := os.Getenv("CREDENTIALS_JSON_PATH")
-	if path == "" {
-		log.Fatal("Environment variable CREDENTIALS_JSON_PATH is not set.")
-	}
-	return path
-}
-
 // init the OAUTH credentials
 func init() {
 	var err error
-	credentialsPath := getCredentialsFilePath()
-	b, err := os.ReadFile(credentialsPath)
-	if err != nil {
-		log.Fatalf("Unable to read client secret file: %v", err)
+	var b []byte
+
+	// Predefined secret name - can be modified as needed
+	const secretName = "oauth-gmail-test-client-secret"
+
+	// Directly retrieve the credentials file path from the environment variable
+	credentialsPath := os.Getenv("CREDENTIALS_JSON_PATH")
+	if credentialsPath != "" {
+		if _, err := os.Stat(credentialsPath); err == nil {
+			// If credentials.json file exists, read from file
+			b, err = os.ReadFile(credentialsPath)
+			if err != nil {
+				log.Fatalf("Unable to read client secret file: %v", err)
+			}
+		}
 	}
 
-	// request the SEND scope via gmail API from user
+	if b == nil {
+		// If no credentials from file, fetch from Google Secret Manager
+		ctx := context.Background()
+		b, err = getCredentialsFromSecretManager(ctx, secretName)
+		if err != nil {
+			log.Fatalf("Unable to read credentials from Secret Manager: %v", err)
+		}
+	}
+
+	// Request the SEND scope via gmail API from user
 	config, err = google.ConfigFromJSON(b, gmail.GmailSendScope)
 	if err != nil {
-		log.Fatalf("Unable to parse client secret file to config: %v", err)
+		log.Fatalf("Unable to parse credentials to config: %v", err)
 	}
+}
+
+// getCredentialsFromSecretManager retrieves credentials from Google Secret Manager.
+func getCredentialsFromSecretManager(ctx context.Context, secretID string) ([]byte, error) {
+	client, err := secretmanager.NewClient(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to setup secretmanager client: %v", err)
+	}
+	defer client.Close()
+
+	// Retrieve the project ID from an environment variable
+	projectID := os.Getenv("GOOGLE_CLOUD_PROJECT")
+	if projectID == "" {
+		return nil, fmt.Errorf("GOOGLE_CLOUD_PROJECT environment variable is not set")
+	}
+
+	// Construct the resource name of the secret version.
+	name := fmt.Sprintf("projects/%s/secrets/%s/versions/latest", projectID, secretID)
+
+	req := &secretmanagerpb.AccessSecretVersionRequest{
+		Name: name,
+	}
+
+	result, err := client.AccessSecretVersion(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to access secret version: %v", err)
+	}
+
+	return result.Payload.Data, nil
 }
 
 // startLocalServer starts a local HTTP server to listen for OAuth callback.
 func startLocalServer(config *oauth2.Config) (chan string, string) {
 	listener, err := net.Listen("tcp", "localhost:0") // Listens on a random port on localhost.
 	if err != nil {
-		log.Fatalf("Failed to listen on a port: %v", err) // Logs fatal error if listening fails.
+		log.Fatalf("Failed to listen on a port: %v", err)
 	}
 	port := listener.Addr().(*net.TCPAddr).Port // Retrieves the chosen port.
 	authCodeChannel := make(chan string)        // Channel to pass the authorization code.
@@ -75,7 +117,7 @@ func startLocalServer(config *oauth2.Config) (chan string, string) {
 	return authCodeChannel, redirectURL
 }
 
-// openBrowser tries to open the authentication URL in the user's web browser.
+// openBrowser opens the authentication URL in the user's web browser.
 func openBrowser(url string, noBrowser bool) {
 	if noBrowser {
 		// If --no-browser flag is set, outputs the URL to the console instead of opening a browser.
@@ -98,7 +140,7 @@ func openBrowser(url string, noBrowser bool) {
 		err = fmt.Errorf("unsupported platform")
 	}
 	if err != nil {
-		log.Fatalf("Unable to open browser: %v", err) // Logs fatal error if opening the browser fails.
+		log.Fatalf("Unable to open browser: %v", err)
 	}
 }
 
@@ -126,16 +168,16 @@ func getTokenFromWeb(config *oauth2.Config, authCodeChannel chan string, noBrows
 		var redirectURL string
 		_, err := fmt.Scan(&redirectURL)
 		if err != nil {
-			log.Fatalf("Failed to read input: %v", err) // Logs fatal error if input reading fails.
+			log.Fatalf("Failed to read input: %v", err)
 		}
 
 		parsedURL, err := url.Parse(redirectURL)
 		if err != nil {
-			log.Fatalf("Failed to parse redirect URL: %v", err) // Logs fatal error if URL parsing fails.
+			log.Fatalf("Failed to parse redirect URL: %v", err)
 		}
 		authCode = parsedURL.Query().Get("code")
 		if authCode == "" {
-			log.Fatal("Authorization code not found in the URL") // Logs fatal error if authorization code is missing.
+			log.Fatal("Authorization code not found in the URL")
 		}
 	} else {
 		authCode = <-authCodeChannel // Receives the authorization code from the channel.
@@ -143,7 +185,7 @@ func getTokenFromWeb(config *oauth2.Config, authCodeChannel chan string, noBrows
 
 	tok, err := config.Exchange(context.Background(), authCode)
 	if err != nil {
-		log.Fatalf("Unable to retrieve token from web: %v", err) // Logs fatal error if token exchange fails.
+		log.Fatalf("Unable to retrieve token from web: %v", err)
 	}
 	return tok
 }
