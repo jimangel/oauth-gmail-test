@@ -48,6 +48,10 @@ func init() {
 			if err != nil {
 				log.Fatalf("Unable to read client secret file: %v", err)
 			}
+		} else {
+			// Handle the case where the file does not exist
+			log.Fatalf("File not found at path: %s", credentialsPath)
+			// Additional handling for missing file can be added here
 		}
 	}
 
@@ -244,16 +248,29 @@ func getEmailTo() (string, error) {
 	return emailTo, nil
 }
 
-// sendTestEmail sends a test email using the Gmail service.
-func sendTestEmail(service *gmail.Service, emailTo string) error {
+// readHTMLTemplate reads an HTML file and returns its content.
+func readHTMLTemplate(filePath string) (string, error) {
+	htmlData, err := os.ReadFile(filePath)
+	if err != nil {
+		return "", fmt.Errorf("unable to read HTML template: %v", err)
+	}
+	return string(htmlData), nil
+}
+
+// sendTestEmail sends a test email using the Gmail service with HTML content.
+func sendTestEmail(service *gmail.Service, emailTo, htmlFilePath string) error {
+	htmlContent, err := readHTMLTemplate(htmlFilePath)
+	if err != nil {
+		return err
+	}
+
 	subject := "Subject: Test Email\n"
-	mime := "MIME-version: 1.0;\nContent-Type: text/plain; charset=\"UTF-8\";\n\n"
-	body := "This is a test email sent by a Golang application."
+	mime := "MIME-version: 1.0;\nContent-Type: text/html; charset=\"UTF-8\";\n\n"
 	msg := []byte("to: " + emailTo + "\r\n" +
 		"from: me\r\n" +
 		subject +
 		mime +
-		"\r\n" + body)
+		"\r\n" + htmlContent)
 
 	var message gmail.Message
 	message.Raw = base64.URLEncoding.EncodeToString(msg)
@@ -284,7 +301,9 @@ func main() {
 		log.Fatal(err)
 	}
 
-	if err := sendTestEmail(gmailService, emailTo); err != nil {
+	htmlTemplatePath := "template.html" // Update this path as needed
+
+	if err := sendTestEmail(gmailService, emailTo, htmlTemplatePath); err != nil {
 		log.Fatal(err)
 	}
 	fmt.Println("Test email sent!")
