@@ -63,8 +63,26 @@ export EMAIL_TO="EMAIL@ADDRESS.COM"
 
 # run the app (opens browser to log in, or add `--no-browser` to copy/paste)
 go run main.go
+```
 
-# The token stays in memory for the duration of the run and an authorization call is made each time via browser
+Expected output:
+
+```
+Token is valid for: 59m58.999965875s
+TokenType: Bearer
+RefreshToken: nil
+Expiry: 2023-11-14 11:13:20.427246 -0600 CST m=+3613.246309667
+Access token contents:
+{
+    "access_type": "online",
+    "aud": "some-string-of-numbers.apps.googleusercontent.com",
+    "azp": "some-string-of-numbers.apps.googleusercontent.com",
+    "exp": "1699982001",
+    "expires_in": "3599",
+    "scope": "https://www.googleapis.com/auth/gmail.send"
+}
+
+Test email sent!
 ```
 
 If using Google Secret Manager for OAuth credentials:
@@ -104,10 +122,10 @@ go run main.go
 
 # with GSM remote creds
 unset CREDENTIALS_JSON_PATH
+export GOOGLE_CLOUD_PROJECT=$(gcloud config get-value project 2> /dev/null)
 go run main.go # should fail
 gcloud auth application-default login
-export GOOGLE_CLOUD_PROJECT=$(gcloud config get-value project 2> /dev/null)
-go run main.go
+go run main.go # should pass
 
 # w/o browser
 go run main.go --no-browser
@@ -115,5 +133,6 @@ go run main.go --no-browser
 
 ## Reference  
 
+- https://cloud.google.com/docs/authentication/token-types#access
 - OOB is deprecated: https://developers.google.com/identity/protocols/oauth2/resources/oob-migration#web-application
 - Inspiration for no-browser: https://stackoverflow.com/a/71491500

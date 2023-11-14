@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -14,6 +16,7 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"time"
 
 	secretmanager "cloud.google.com/go/secretmanager/apiv1"
 	"cloud.google.com/go/secretmanager/apiv1/secretmanagerpb"
@@ -149,18 +152,20 @@ func openBrowser(url string, noBrowser bool) {
 }
 
 // getTokenFromWeb handles the OAuth authentication flow and retrieves the token.
+// To prevent a refresh token from being issued, you should use oauth2.AccessTypeOnline instead of oauth2.AccessTypeOffline.
+// This indicates that your application does not require offline access and thus does not need a refresh token.
 func getTokenFromWeb(config *oauth2.Config, authCodeChannel chan string, noBrowser bool) *oauth2.Token {
 	var authURL string
-	// Generates the authentication URL with or without state token based on the --no-browser flag.
+	// Generates the authentication URL without requesting offline access
 	if noBrowser {
-		authURL = config.AuthCodeURL("", oauth2.AccessTypeOffline)
+		authURL = config.AuthCodeURL("", oauth2.AccessTypeOnline)
 	} else {
 		b := make([]byte, 32)
 		if _, err := rand.Read(b); err != nil {
-			log.Fatalf("Unable to generate state token: %v", err) // Logs fatal error if state token generation fails.
+			log.Fatalf("Unable to generate state token: %v", err)
 		}
 		stateToken := base64.URLEncoding.EncodeToString(b)
-		authURL = config.AuthCodeURL(stateToken, oauth2.AccessTypeOffline)
+		authURL = config.AuthCodeURL(stateToken, oauth2.AccessTypeOnline)
 	}
 
 	openBrowser(authURL, noBrowser) // Opens the authentication URL in the browser.
@@ -191,7 +196,60 @@ func getTokenFromWeb(config *oauth2.Config, authCodeChannel chan string, noBrows
 	if err != nil {
 		log.Fatalf("Unable to retrieve token from web: %v", err)
 	}
+
+	// FOR DEBUG
+	// Check if the token has an expiry time set
+	if !tok.Expiry.IsZero() {
+		// Calculate the duration until the token expires
+		timeLeft := time.Until(tok.Expiry)
+		fmt.Printf("Token is valid for: %v\n", timeLeft)
+		fmt.Printf("TokenType: %s\n", tok.TokenType)
+		if tok.RefreshToken == "" {
+			fmt.Println("RefreshToken: nil")
+		} else {
+			fmt.Printf("RefreshToken: %s\n", tok.RefreshToken)
+		}
+		fmt.Printf("Expiry: %v\n", tok.Expiry)
+	} else {
+		// Handle the case where the token does not expire
+		fmt.Println("This token does not have an expiration time.")
+	}
+	// Fetch token information from Google's tokeninfo endpoint
+	tokenInfo, err := fetchTokenInfo(tok.AccessToken)
+	if err != nil {
+		fmt.Printf("Error fetching token info: %v\n", err)
+	} else {
+		prettyJSON, err := json.MarshalIndent(tokenInfo, "", "    ")
+		if err != nil {
+			fmt.Printf("Failed to generate pretty JSON: %v\n", err)
+		} else {
+			fmt.Printf("Access token contents:\n%s\n\n", prettyJSON)
+		}
+	}
+
 	return tok
+}
+
+// FOR DEBUG
+// fetchTokenInfo makes an HTTP request to Google's tokeninfo endpoint and returns the token information.
+func fetchTokenInfo(accessToken string) (map[string]interface{}, error) {
+	resp, err := http.Get("https://oauth2.googleapis.com/tokeninfo?access_token=" + accessToken)
+	if err != nil {
+		return nil, fmt.Errorf("error making request to tokeninfo endpoint: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("error reading response body: %v", err)
+	}
+
+	var data map[string]interface{}
+	if err := json.Unmarshal(body, &data); err != nil {
+		return nil, fmt.Errorf("error unmarshaling token info: %v", err)
+	}
+
+	return data, nil
 }
 
 // tokenHasScopes checks if the token includes all the required scopes.
